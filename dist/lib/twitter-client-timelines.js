@@ -19,18 +19,28 @@ export function withTimelines(Base) {
             }
         }
         async getBookmarksQueryIds() {
-            // X.com renamed the "Bookmarks" GraphQL operation to "BookmarkSearchTimeline".
-            // Look up the new operation name first, then fall back to the legacy "Bookmarks"
-            // entry (still present in some cached query-id snapshots), then to known IDs.
-            const primary = await this.getQueryId('BookmarkSearchTimeline');
+            // The legacy `Bookmarks` operation is still served by the X GraphQL backend
+            // and is what x.com's web client uses for `/i/bookmarks` page loads. We try
+            // it first because `BookmarkSearchTimeline` with `rawQuery: 'filter:bookmarks'`
+            // returns an empty timeline for many accounts (it is the search box backend,
+            // not a drop-in replacement for the unfiltered bookmarks list).
             const legacy = await this.getQueryId('Bookmarks');
-            return Array.from(new Set([
-                primary,
-                legacy,
-                '5kB8iO1n19yXfcxM4e30Nw',
-                'RV1g3b8n_SGOHwkqKYSCFw',
-                'tmd4ifV8RHltzn8ymGg1aw',
-            ].filter(Boolean)));
+            const search = await this.getQueryId('BookmarkSearchTimeline');
+            const ops = [];
+            const seen = new Set();
+            const push = (queryId, operation) => {
+                if (!queryId) return;
+                const key = `${operation}::${queryId}`;
+                if (seen.has(key)) return;
+                seen.add(key);
+                ops.push({ queryId, operation });
+            };
+            push(legacy, 'Bookmarks');
+            push('RV1g3b8n_SGOHwkqKYSCFw', 'Bookmarks');
+            push('tmd4ifV8RHltzn8ymGg1aw', 'Bookmarks');
+            push(search, 'BookmarkSearchTimeline');
+            push('5kB8iO1n19yXfcxM4e30Nw', 'BookmarkSearchTimeline');
+            return ops;
         }
         async getBookmarkFolderQueryIds() {
             const primary = await this.getQueryId('BookmarkFolderTimeline');
@@ -199,28 +209,36 @@ export function withTimelines(Base) {
             const fetchPage = async (pageCount, pageCursor) => {
                 let lastError;
                 let had404 = false;
-                const queryIds = await this.getBookmarksQueryIds();
-                const variables = {
-                    // BookmarkSearchTimeline requires `rawQuery`. Passing `filter:bookmarks`
-                    // returns the user's full bookmark timeline (equivalent to the old
-                    // unfiltered `Bookmarks` operation).
-                    rawQuery: 'filter:bookmarks',
-                    count: pageCount,
-                    includePromotedContent: false,
-                    withDownvotePerspective: false,
-                    withReactionsMetadata: false,
-                    withReactionsPerspective: false,
-                    ...(pageCursor ? { cursor: pageCursor } : {}),
+                const ops = await this.getBookmarksQueryIds();
+                const buildVariables = (operation) => {
+                    const base = {
+                        count: pageCount,
+                        includePromotedContent: false,
+                        withDownvotePerspective: false,
+                        withReactionsMetadata: false,
+                        withReactionsPerspective: false,
+                        ...(pageCursor ? { cursor: pageCursor } : {}),
+                    };
+                    if (operation === 'BookmarkSearchTimeline') {
+                        // Search-style endpoint requires `rawQuery`. `filter:bookmarks`
+                        // historically returned the user's full bookmark list; some
+                        // accounts now get an empty timeline so this is only used as
+                        // a fallback when the legacy `Bookmarks` op is unavailable.
+                        return { rawQuery: 'filter:bookmarks', ...base };
+                    }
+                    return base;
                 };
-                const params = new URLSearchParams({
-                    variables: JSON.stringify(variables),
-                    features: JSON.stringify(features),
-                });
-                for (const queryId of queryIds) {
-                    const url = `${TWITTER_API_BASE}/${queryId}/BookmarkSearchTimeline?${params.toString()}`;
+                for (const { queryId, operation } of ops) {
+                    const variables = buildVariables(operation);
+                    const params = new URLSearchParams({
+                        variables: JSON.stringify(variables),
+                        features: JSON.stringify(features),
+                    });
+                    const url = `${TWITTER_API_BASE}/${queryId}/${operation}?${params.toString()}`;
                     try {
                         this.logBookmarksDebug('request bookmarks page', {
                             queryId,
+                            operation,
                             pageCount,
                             hasCursor: Boolean(pageCursor),
                         });
@@ -231,35 +249,57 @@ export function withTimelines(Base) {
                         if (response.status === 404) {
                             had404 = true;
                             lastError = `HTTP ${response.status}`;
-                            this.logBookmarksDebug('bookmarks 404', { queryId });
+                            this.logBookmarksDebug('bookmarks 404', { queryId, operation });
                             continue;
                         }
                         if (!response.ok) {
                             const text = await response.text();
                             this.logBookmarksDebug('bookmarks non-200', {
                                 queryId,
+                                operation,
                                 status: response.status,
                                 body: text.slice(0, 200),
                             });
+                            // 4xx (other than 404) usually means the variables shape is
+                            // wrong for this operation — skip to the next candidate so a
+                            // legacy 422 doesn't mask a working fallback.
+                            if (response.status >= 400 && response.status < 500) {
+                                lastError = `HTTP ${response.status}: ${text.slice(0, 200)}`;
+                                continue;
+                            }
                             return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 200)}`, had404 };
                         }
                         const data = (await response.json());
-                        // BookmarkSearchTimeline wraps the timeline under
-                        // data.search_by_raw_query.bookmarks_search_timeline. Fall back to
-                        // the legacy bookmark_timeline_v2 path so older query IDs still parse.
-                        const instructions = data.data?.search_by_raw_query?.bookmarks_search_timeline?.timeline?.instructions
-                            ?? data.data?.bookmark_timeline_v2?.timeline?.instructions;
-                        const pageTweets = parseTweetsFromInstructions(instructions, { quoteDepth: this.quoteDepth, includeRaw });
-                        const nextCursor = extractCursorFromInstructions(instructions);
+                        // Each operation puts the timeline at a different path:
+                        //   Bookmarks                → data.bookmark_timeline_v2.timeline.instructions
+                        //   BookmarkSearchTimeline   → data.search_by_raw_query.bookmarks_search_timeline.timeline.instructions
+                        const instructions = data.data?.bookmark_timeline_v2?.timeline?.instructions
+                            ?? data.data?.search_by_raw_query?.bookmarks_search_timeline?.timeline?.instructions;
                         if (data.errors && data.errors.length > 0) {
-                            this.logBookmarksDebug('bookmarks graphql errors (non-fatal)', { queryId, errors: data.errors });
+                            this.logBookmarksDebug('bookmarks graphql errors', { queryId, operation, errors: data.errors });
                             if (!instructions) {
                                 lastError = data.errors.map((e) => e.message).join(', ');
                                 continue;
                             }
                         }
+                        const pageTweets = parseTweetsFromInstructions(instructions, { quoteDepth: this.quoteDepth, includeRaw });
+                        const nextCursor = extractCursorFromInstructions(instructions);
+                        // BookmarkSearchTimeline often returns 200 with only cursor entries
+                        // (and no tweets) for accounts where `filter:bookmarks` does not
+                        // match anything. If we got 0 tweets and no cursor on the very
+                        // first page, fall through to the next candidate operation rather
+                        // than reporting an empty timeline as the final answer.
+                        const isEmptyFirstPage = !pageCursor
+                            && pageTweets.length === 0
+                            && !nextCursor;
+                        if (isEmptyFirstPage && operation === 'BookmarkSearchTimeline') {
+                            this.logBookmarksDebug('bookmarks empty first page (skipping)', { queryId, operation });
+                            lastError = 'empty timeline from BookmarkSearchTimeline';
+                            continue;
+                        }
                         this.logBookmarksDebug('bookmarks page parsed', {
                             queryId,
+                            operation,
                             tweets: pageTweets.length,
                             hasNextCursor: Boolean(nextCursor),
                         });
@@ -267,7 +307,7 @@ export function withTimelines(Base) {
                     }
                     catch (error) {
                         lastError = error instanceof Error ? error.message : String(error);
-                        this.logBookmarksDebug('bookmarks request error', { queryId, error: lastError });
+                        this.logBookmarksDebug('bookmarks request error', { queryId, operation, error: lastError });
                     }
                 }
                 return { success: false, error: lastError ?? 'Unknown error fetching bookmarks', had404 };
