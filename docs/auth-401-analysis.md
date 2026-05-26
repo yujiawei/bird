@@ -92,35 +92,44 @@ Empirical re-test against the live X API with the same cookies on @jwyu10 showed
 |---|---|
 | HomeTimeline / HomeLatestTimeline | ✅ HTTP 200 (returns tweet data) once `bird query-ids --fresh` populated the runtime cache; the 401 reported in the original investigation reproduces only when stale query IDs are used. |
 | Likes | ✅ HTTP 200 (returns tweet data). |
-| Bookmarks | ❌ HTTP 422 `GRAPHQL_VALIDATION_FAILED` — **NOT 401**. The renamed `BookmarkSearchTimeline` operation requires a `rawQuery` variable; calling `…/Bookmarks?…` against the new query ID is the only failure that needs source changes. |
+| Bookmarks | ❌ HTTP 200 with empty `entries` (cursor-only) — **not a 401 either**. `BookmarkSearchTimeline` with `rawQuery: "filter:bookmarks"` returned no tweets for the affected accounts; the legacy `Bookmarks` operation (queryId `RV1g3b8n_SGOHwkqKYSCFw`) is still served by the X GraphQL backend and continues to return the unfiltered bookmark timeline. |
 
-### Root cause for Bookmarks 422
+### Browser capture (YUJ-2079)
 
-x.com's web bundle (`main.ede5acfa.js`) no longer ships an operation named `Bookmarks`. The unfiltered timeline is now served by `BookmarkSearchTimeline` (queryId `5kB8iO1n19yXfcxM4e30Nw`), which:
+Captured headers from `x.com`'s web client side-by-side with bird's request: `x-csrf-token`, `cookie` (`auth_token=…; ct0=…`), `authorization: Bearer …`, and a randomly-generated `x-client-transaction-id` are sufficient to reach 200 from a residential or server IP. Adding the full Camofox cookie jar (`twid`, `kdt`, `guest_id`, `personalization_id`, `lang`, `d_prefs`, `__cuid`, `guest_id_ads`, `guest_id_marketing`) produces the same status codes — the original 401 hypotheses (transaction-id signing, browser-fingerprint cookies, `sec-ch-ua` headers) were red herrings.
 
-1. Validates a required string variable named `rawQuery`. Sending no rawQuery yields `must be defined` → 422. Sending an empty string yields `ERROR_EMPTY_QUERY` → 200 with `code:214` Validation error.
-2. Returns the timeline under `data.search_by_raw_query.bookmarks_search_timeline.timeline.instructions` instead of the previous `data.bookmark_timeline_v2.timeline.instructions`.
+### Root cause for Bookmarks empty result
 
-Setting `rawQuery: "filter:bookmarks"` reproduces the legacy "all bookmarks" view.
+YUJ-2078 switched the Bookmarks call to `BookmarkSearchTimeline` with `rawQuery: "filter:bookmarks"`, on the assumption that the operation had been renamed. In reality both operations exist and serve different purposes:
 
-### Fix applied
+- `Bookmarks` (`RV1g3b8n_SGOHwkqKYSCFw`) — the unfiltered bookmark timeline, used by `/i/bookmarks` page loads. Variables: `count`, `includePromotedContent`, `withDownvotePerspective`, `withReactionsMetadata`, `withReactionsPerspective`. Response under `data.bookmark_timeline_v2.timeline.instructions`.
+- `BookmarkSearchTimeline` (`5kB8iO1n19yXfcxM4e30Nw`) — the search-box backend. Requires a `rawQuery`. With `rawQuery: "filter:bookmarks"` it returns 200 with cursor-only entries (no tweets) for accounts whose bookmark search index has not been populated. Response under `data.search_by_raw_query.bookmarks_search_timeline.timeline.instructions`.
 
-`dist/lib/twitter-client-timelines.js` (the only TS->JS source shipped in this fork):
+Two bugs compounded:
 
-- `getBookmarksQueryIds()` now resolves `BookmarkSearchTimeline` first, with `Bookmarks` and the literal `5kB8iO1n19yXfcxM4e30Nw` as fallbacks.
+1. The previous fetch loop hard-coded `BookmarkSearchTimeline` in the URL even when iterating over the legacy `Bookmarks` queryIds, so `…/RV1g3b8n_SGOHwkqKYSCFw/BookmarkSearchTimeline` was tried (incorrect operation pairing).
+2. The `rawQuery: "filter:bookmarks"` payload returns no tweets for the target account, so even the `5kB8iO1n19yXfcxM4e30Nw` queryId could not produce data.
+
+### Fix applied (YUJ-2079)
+
+`dist/lib/twitter-client-timelines.js`:
+
+- `getBookmarksQueryIds()` now returns `{queryId, operation}` pairs, with the legacy `Bookmarks` op tried first and `BookmarkSearchTimeline` as fallback.
 - `getBookmarksPaged.fetchPage`:
-  - URL: `…/${queryId}/Bookmarks` → `…/${queryId}/BookmarkSearchTimeline`.
-  - `variables`: added `rawQuery: "filter:bookmarks"`.
-  - Response parsing accepts both `search_by_raw_query.bookmarks_search_timeline.timeline.instructions` and the legacy `bookmark_timeline_v2.timeline.instructions`.
-
-`dist/lib/twitter-client-constants.js` and `dist/lib/query-ids.json` also gained a `BookmarkSearchTimeline` entry, and `dist/commands/query-ids.js` adds it to the refresh target list so `bird query-ids --fresh` discovers the live ID from x.com bundles.
+  - URL: `…/${queryId}/${operation}` so each queryId is paired with the matching operation name.
+  - `variables`: `rawQuery: "filter:bookmarks"` is only sent when calling `BookmarkSearchTimeline`; the legacy `Bookmarks` op gets the unfiltered shape.
+  - 4xx (other than 404) on one candidate now skips to the next candidate so a legacy 422 cannot mask a working fallback.
+  - When `BookmarkSearchTimeline` returns 200 with no tweets and no cursor on the first page, the loop falls through to the next candidate instead of reporting an empty timeline.
+  - Response parsing reads `data.bookmark_timeline_v2.timeline.instructions` first, then falls back to `data.search_by_raw_query.bookmarks_search_timeline.timeline.instructions`.
 
 ### Verification
 
 ```
-bird home -n 5 --json       → tweet data
-bird likes -n 5 --json      → tweet data
-bird bookmarks -n 5 --json  → []           # @jwyu10 has no current bookmarks; HTTP 200, no errors
+bird home -n 3 --json       → 3 tweets
+bird likes -n 3 --json      → 3 tweets
+bird bookmarks -n 3 --json  → 3 tweets
 ```
 
-The original 401 hypotheses (transaction-id signing, missing feature flags) turned out not to be needed for any of the three endpoints once the operation rename was addressed.
+Verified on the same Mac (Node v26.0.0, bird v0.8.0 + this patch) with the cookies in `~/.zshrc`.
+
+The original 401 hypotheses (transaction-id signing, missing feature flags) turned out not to be needed for any of the three endpoints.
