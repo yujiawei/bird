@@ -27,6 +27,7 @@ export function registerQueryIdsCommand(program, ctx) {
             'SearchTimeline',
             'UserArticlesTweets',
             'Bookmarks',
+            'BookmarkSearchTimeline',
             'Following',
             'Followers',
             'Likes',

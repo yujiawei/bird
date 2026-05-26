@@ -19,8 +19,18 @@ export function withTimelines(Base) {
             }
         }
         async getBookmarksQueryIds() {
-            const primary = await this.getQueryId('Bookmarks');
-            return Array.from(new Set([primary, 'RV1g3b8n_SGOHwkqKYSCFw', 'tmd4ifV8RHltzn8ymGg1aw']));
+            // X.com renamed the "Bookmarks" GraphQL operation to "BookmarkSearchTimeline".
+            // Look up the new operation name first, then fall back to the legacy "Bookmarks"
+            // entry (still present in some cached query-id snapshots), then to known IDs.
+            const primary = await this.getQueryId('BookmarkSearchTimeline');
+            const legacy = await this.getQueryId('Bookmarks');
+            return Array.from(new Set([
+                primary,
+                legacy,
+                '5kB8iO1n19yXfcxM4e30Nw',
+                'RV1g3b8n_SGOHwkqKYSCFw',
+                'tmd4ifV8RHltzn8ymGg1aw',
+            ].filter(Boolean)));
         }
         async getBookmarkFolderQueryIds() {
             const primary = await this.getQueryId('BookmarkFolderTimeline');
@@ -191,6 +201,10 @@ export function withTimelines(Base) {
                 let had404 = false;
                 const queryIds = await this.getBookmarksQueryIds();
                 const variables = {
+                    // BookmarkSearchTimeline requires `rawQuery`. Passing `filter:bookmarks`
+                    // returns the user's full bookmark timeline (equivalent to the old
+                    // unfiltered `Bookmarks` operation).
+                    rawQuery: 'filter:bookmarks',
                     count: pageCount,
                     includePromotedContent: false,
                     withDownvotePerspective: false,
@@ -203,7 +217,7 @@ export function withTimelines(Base) {
                     features: JSON.stringify(features),
                 });
                 for (const queryId of queryIds) {
-                    const url = `${TWITTER_API_BASE}/${queryId}/Bookmarks?${params.toString()}`;
+                    const url = `${TWITTER_API_BASE}/${queryId}/BookmarkSearchTimeline?${params.toString()}`;
                     try {
                         this.logBookmarksDebug('request bookmarks page', {
                             queryId,
@@ -230,7 +244,11 @@ export function withTimelines(Base) {
                             return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 200)}`, had404 };
                         }
                         const data = (await response.json());
-                        const instructions = data.data?.bookmark_timeline_v2?.timeline?.instructions;
+                        // BookmarkSearchTimeline wraps the timeline under
+                        // data.search_by_raw_query.bookmarks_search_timeline. Fall back to
+                        // the legacy bookmark_timeline_v2 path so older query IDs still parse.
+                        const instructions = data.data?.search_by_raw_query?.bookmarks_search_timeline?.timeline?.instructions
+                            ?? data.data?.bookmark_timeline_v2?.timeline?.instructions;
                         const pageTweets = parseTweetsFromInstructions(instructions, { quoteDepth: this.quoteDepth, includeRaw });
                         const nextCursor = extractCursorFromInstructions(instructions);
                         if (data.errors && data.errors.length > 0) {
