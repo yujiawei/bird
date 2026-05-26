@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased (yujiawei/bird fork)
+
+### Fixed
+- `bookmarks`: x.com renamed the `Bookmarks` GraphQL operation to `BookmarkSearchTimeline`, so unfiltered requests started returning HTTP 422 `GRAPHQL_VALIDATION_FAILED`. The bookmarks read path now targets `BookmarkSearchTimeline`, sends the required `rawQuery: "filter:bookmarks"` variable, parses the timeline from `data.search_by_raw_query.bookmarks_search_timeline.timeline.instructions` (with a fallback to the legacy `bookmark_timeline_v2` shape), and adds `BookmarkSearchTimeline` to the query-ids refresh target list and bundled snapshot. Resolves #1.
+
 ## 0.8.0 — 2026-01-19
 
 ### Added

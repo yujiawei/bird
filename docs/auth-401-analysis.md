@@ -81,3 +81,46 @@ Key source files (compiled JS, no TypeScript source available):
 - `dist/lib/twitter-client-features.js` — Feature flag builders
 - `dist/lib/twitter-client-constants.js` — Query IDs, fallbacks
 - `dist/lib/runtime-query-ids.js` — Runtime query ID refresh from x.com bundles
+
+---
+
+## Resolution (2026-05-26)
+
+Empirical re-test against the live X API with the same cookies on @jwyu10 showed:
+
+| Endpoint | Actual status |
+|---|---|
+| HomeTimeline / HomeLatestTimeline | ✅ HTTP 200 (returns tweet data) once `bird query-ids --fresh` populated the runtime cache; the 401 reported in the original investigation reproduces only when stale query IDs are used. |
+| Likes | ✅ HTTP 200 (returns tweet data). |
+| Bookmarks | ❌ HTTP 422 `GRAPHQL_VALIDATION_FAILED` — **NOT 401**. The renamed `BookmarkSearchTimeline` operation requires a `rawQuery` variable; calling `…/Bookmarks?…` against the new query ID is the only failure that needs source changes. |
+
+### Root cause for Bookmarks 422
+
+x.com's web bundle (`main.ede5acfa.js`) no longer ships an operation named `Bookmarks`. The unfiltered timeline is now served by `BookmarkSearchTimeline` (queryId `5kB8iO1n19yXfcxM4e30Nw`), which:
+
+1. Validates a required string variable named `rawQuery`. Sending no rawQuery yields `must be defined` → 422. Sending an empty string yields `ERROR_EMPTY_QUERY` → 200 with `code:214` Validation error.
+2. Returns the timeline under `data.search_by_raw_query.bookmarks_search_timeline.timeline.instructions` instead of the previous `data.bookmark_timeline_v2.timeline.instructions`.
+
+Setting `rawQuery: "filter:bookmarks"` reproduces the legacy "all bookmarks" view.
+
+### Fix applied
+
+`dist/lib/twitter-client-timelines.js` (the only TS->JS source shipped in this fork):
+
+- `getBookmarksQueryIds()` now resolves `BookmarkSearchTimeline` first, with `Bookmarks` and the literal `5kB8iO1n19yXfcxM4e30Nw` as fallbacks.
+- `getBookmarksPaged.fetchPage`:
+  - URL: `…/${queryId}/Bookmarks` → `…/${queryId}/BookmarkSearchTimeline`.
+  - `variables`: added `rawQuery: "filter:bookmarks"`.
+  - Response parsing accepts both `search_by_raw_query.bookmarks_search_timeline.timeline.instructions` and the legacy `bookmark_timeline_v2.timeline.instructions`.
+
+`dist/lib/twitter-client-constants.js` and `dist/lib/query-ids.json` also gained a `BookmarkSearchTimeline` entry, and `dist/commands/query-ids.js` adds it to the refresh target list so `bird query-ids --fresh` discovers the live ID from x.com bundles.
+
+### Verification
+
+```
+bird home -n 5 --json       → tweet data
+bird likes -n 5 --json      → tweet data
+bird bookmarks -n 5 --json  → []           # @jwyu10 has no current bookmarks; HTTP 200, no errors
+```
+
+The original 401 hypotheses (transaction-id signing, missing feature flags) turned out not to be needed for any of the three endpoints once the operation rename was addressed.
